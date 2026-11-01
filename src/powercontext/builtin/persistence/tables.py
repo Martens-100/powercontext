@@ -1189,3 +1189,20 @@ BUILTIN_TABLES = (
     + RECURRENCE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
 )
+
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("kind", identity_string(16), nullable=False),
+    Column("reference", Text, nullable=False),
+    Column("parents", Text, nullable=False),
+    Column("policy", identity_string(8), nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("sequence", Integer, nullable=False),
+    Column("active", Boolean, nullable=False),
+    Column("fingerprint", Text, nullable=False),
+    CheckConstraint("revision >= 0", name="ck_pc_source_lifecycle_nodes_revision_nonnegative"),
+    CheckConstraint("sequence >= 0", name="ck_pc_source_lifecycle_nodes_sequence_nonnegative"),
+)
