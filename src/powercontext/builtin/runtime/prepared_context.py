@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -56,6 +57,32 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+    # Set only by the evidence-selection path, where the content is a literal
+    # slice of the entry body and the reader must be able to re-cut it.
+    start: int | None = None
+    end: int | None = None
+
+
+@dataclass(frozen=True)
+class _FragmentCandidate:
+    """One literal sentence of one candidate entry, ranked against the query."""
+
+    score: int
+    order: int
+    address: MemoryEntryAddress
+    text: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One exact slice of one Memory entry, with its address and coordinates."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -106,6 +133,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +263,14 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            # The selection mode answers only for Memory candidates; Code,
+            # Topic Memory and Experience stay out of scope by contract.
+            return self._select_fragments_result(
+                request=request,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -292,6 +328,91 @@ class PreparedContextBuilder:
             truncated_items=omissions.truncated_items,
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
+        )
+
+    def _select_fragments_result(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Pick literal sentence slices of the candidates under the byte budget.
+
+        Sentences are ranked by how many query terms they carry, then packed in
+        that order while the *rendered* output still fits ``max_bytes``. The
+        budget is measured on the finished document, so citation overhead and
+        the trust envelope are charged before any content is admitted.
+        """
+
+        terms = _query_terms(request.query)
+        candidates: list[_FragmentCandidate] = []
+        order = 0
+        for group in memory_candidates:
+            if group.hits and group.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            for hit in group.hits:
+                if hit.memory_ref != group.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
+                    continue
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                for raw_start, raw_end in _sentence_spans(hit.text):
+                    start, end = _trim_span(hit.text, raw_start, raw_end)
+                    if end <= start:
+                        continue
+                    body = hit.text[start:end]
+                    candidates.append(
+                        _FragmentCandidate(
+                            score=_score_fragment(body, terms),
+                            order=order,
+                            address=address,
+                            text=body,
+                            start=start,
+                            end=end,
+                        )
+                    )
+                    order += 1
+        if not candidates:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        entries: list[_PreparedContextEntry] = []
+        for candidate in sorted(candidates, key=lambda item: (-item.score, item.order)):
+            entry = _PreparedContextEntry(
+                origin=candidate.address,
+                kind="memory",
+                citation=_fragment_citation(candidate.address),
+                content=candidate.text,
+                truncated=False,
+                start=candidate.start,
+                end=candidate.end,
+            )
+            if _rendered_bytes((*entries, entry)) > request.max_bytes:
+                continue
+            entries.append(entry)
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        content = _render(entries)
+        return PreparedContextBuild(
+            context=PreparedContext(
+                status="ready",
+                content=content,
+                content_bytes=len(content.encode("utf-8")),
+            ),
+            origins=tuple(entry.origin for entry in entries),
+            fragments=tuple(
+                PreparedContextFragment(
+                    address=entry.origin,  # type: ignore[arg-type]
+                    start=entry.start,  # type: ignore[arg-type]
+                    end=entry.end,  # type: ignore[arg-type]
+                    text=entry.content,
+                )
+                for entry in entries
+            ),
         )
 
     def _select_entries(
@@ -710,6 +831,15 @@ def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:
 
 
 def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
+    if entry.start is not None and entry.end is not None:
+        # A selection fragment is exact, so coordinates replace the truncation
+        # flag: the reader can re-cut entry.text[start:end] to check it.
+        return {
+            "citation": entry.citation,
+            "content": entry.content,
+            "start": entry.start,
+            "end": entry.end,
+        }
     rendered: dict[str, object] = {
         "citation": entry.citation,
         "content": entry.content,
@@ -728,3 +858,51 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_WORD_PATTERN = re.compile(r"[a-z]+|\d+")
+_SENTENCE_BREAKS = frozenset(".!?\n\u3002\uff01\uff1f")
+
+
+def _query_terms(query: str) -> frozenset[str]:
+    return frozenset(_WORD_PATTERN.findall(query.casefold()))
+
+
+def _score_fragment(text: str, terms: frozenset[str]) -> int:
+    if not terms:
+        return 0
+    words = set(_WORD_PATTERN.findall(text.casefold()))
+    return len(words & terms)
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Split on sentence punctuation, keeping every offset inside the original."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char in _SENTENCE_BREAKS:
+            spans.append((start, index + 1))
+            start = index + 1
+    if start < len(text):
+        spans.append((start, len(text)))
+    return [(start, end) for start, end in spans if end > start]
+
+
+def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Drop surrounding whitespace without leaving the original character range."""
+
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _fragment_citation(address: MemoryEntryAddress) -> dict[str, object]:
+    return {
+        "scope_id": address.memory.scope_id,
+        "memory_ref": address.memory.artifact.model_dump(mode="json"),
+        "entry_id": address.entry_id,
+        "entry_version_id": address.entry_version_id,
+    }
